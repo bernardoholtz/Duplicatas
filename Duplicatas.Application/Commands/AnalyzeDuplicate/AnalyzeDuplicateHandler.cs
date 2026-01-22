@@ -6,6 +6,7 @@ using CustomerPlatform.Domain.Interfaces;
 using Duplicatas.Application.DTO;
 using Duplicatas.Domain.Interfaces;
 using MediatR;
+using Microsoft.Extensions.Logging;
 using Nest;
 using Notification.Domain.Interfaces;
 using System.Text.Json;
@@ -16,135 +17,259 @@ public class AnalyzeDuplicateHandler : IRequestHandler<AnalyzeDuplicateCommand>
     private readonly ISuspeitaDuplicidade _repository;
     private readonly IUnitOfWork _unitOfWork;
     private readonly IRabbitMQ _rabbitMQ;
+    private readonly ILogger<AnalyzeDuplicateHandler> _logger;
     private const string NomeEvento = "DuplicataSuspeita";
 
     public AnalyzeDuplicateHandler(IElasticClient elasticClient, 
         ISuspeitaDuplicidade repository, 
         IUnitOfWork unitOfWork,
-        IRabbitMQ rabbitMQ)
+        IRabbitMQ rabbitMQ,
+        ILogger<AnalyzeDuplicateHandler> logger)
     {
         _elasticClient = elasticClient;
         _repository = repository;
         _unitOfWork = unitOfWork;
         _rabbitMQ = rabbitMQ;
+        _logger = logger;
 
     }
 
     public async Task Handle(AnalyzeDuplicateCommand request, CancellationToken ct)
     {
-        var original = request.EventData.Data;
-
-        string usernameOriginal = original.Email?.Split('@')[0] ?? string.Empty;
-
-        var searchResponse = await _elasticClient.SearchAsync<CustomerSearchDto>(s => s
-            .Index("customers")
-            .Query(q => q
-                .Bool(b => b
-                    .Should(
-                        sh => sh.Match(m => m.Field(f => f.Nome).Query(original.Nome).Fuzziness(Fuzziness.Auto)),
-                        sh => sh.Match(m => m.Field(f => f.Documento).Query(original.Documento)),
-
-                        sh => sh.Match(m => m.Field(f => f.Email)
-                            .Query(usernameOriginal)
-                            .Fuzziness(Fuzziness.Auto)
-                            .PrefixLength(3) 
-                            .Boost(1.5)),
-
-                        sh => sh.Term(t => t.Field("telefone.keyword").Value(original.Telefone).Boost(2.0))
-                    )
-                    .MustNot(m => m.Term(t => t.Field("id").Value(original.ClienteId)))
-                )
-            )
-            .Highlight(h => h
-                .Fields(
-                    f => f.Field(fname => fname.Nome),
-                    f => f.Field(fname => fname.Email),
-                    f => f.Field(fname => fname.Documento),
-                    f => f.Field("telefone.keyword")
-                )
-                .PreTags("").PostTags("")
-            )
-        );
-
-        if (!searchResponse.IsValid) return;
-
-        foreach (var hit in searchResponse.Hits)
+        if (request?.EventData?.Data == null)
         {
-            if (hit.Score > 4)
+            _logger.LogWarning("Comando recebido com dados inválidos ou nulos");
+            return;
+        }
+
+        try
+        {
+            var original = request.EventData.Data;
+
+            if (original.ClienteId == Guid.Empty)
             {
-                var duplicado = hit.Source;
-                var comparativoList = hit.Highlight.Select(h => new
-                {
-                    Campo = h.Key,
-                    ValorOriginal = ObterValorPorCampo(original, h.Key),
-                    ValorEncontrado = string.Join(", ", h.Value),
-                    ScoreCampo = hit.Score
-                }).ToList();
+                _logger.LogWarning("ClienteId inválido no evento. EventId: {EventId}", request.EventData.EventId);
+                return;
+            }
 
-                if (!ValidarUsernameSimilar(original.Email, duplicado.Email))
-                {
-                    comparativoList.RemoveAll(x => x.Campo.ToLower() == "email");
-                }
+            string usernameOriginal = original.Email?.Split('@')[0] ?? string.Empty;
 
-                if (comparativoList.Any())
+            ISearchResponse<CustomerSearchDto> searchResponse;
+            try
+            {
+                searchResponse = await _elasticClient.SearchAsync<CustomerSearchDto>(s => s
+                    .Index("customers")
+                    .Query(q => q
+                        .Bool(b => b
+                            .Should(
+                                sh => sh.Match(m => m.Field(f => f.Nome).Query(original.Nome).Fuzziness(Fuzziness.Auto)),
+                                sh => sh.Match(m => m.Field(f => f.Documento).Query(original.Documento)),
+
+                                sh => sh.Match(m => m.Field(f => f.Email)
+                                    .Query(usernameOriginal)
+                                    .Fuzziness(Fuzziness.Auto)
+                                    .PrefixLength(3) 
+                                    .Boost(1.5)),
+
+                                sh => sh.Term(t => t.Field("telefone.keyword").Value(original.Telefone).Boost(2.0))
+                            )
+                            .MustNot(m => m.Term(t => t.Field("id").Value(original.ClienteId)))
+                        )
+                    )
+                    .Highlight(h => h
+                        .Fields(
+                            f => f.Field(fname => fname.Nome),
+                            f => f.Field(fname => fname.Email),
+                            f => f.Field(fname => fname.Documento),
+                            f => f.Field("telefone.keyword")
+                        )
+                        .PreTags("").PostTags("")
+                    )
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Erro ao buscar no Elasticsearch. ClienteId: {ClienteId}, EventId: {EventId}", 
+                    original.ClienteId, request.EventData.EventId);
+                throw;
+            }
+
+            if (!searchResponse.IsValid)
+            {
+                _logger.LogWarning("Resposta inválida do Elasticsearch. ClienteId: {ClienteId}, Erro: {Erro}", 
+                    original.ClienteId, searchResponse.ServerError?.Error?.Reason);
+                return;
+            }
+
+            foreach (var hit in searchResponse.Hits)
+            {
+                try
                 {
-                    var suspeita = new SuspeitaDuplicidade
+                    if (hit.Score > 4)
                     {
-                        IdOriginal = original.ClienteId,
-                        IdSuspeito = duplicado.Id,
-                        Score = hit.Score ?? 0,
-                        DetalhesSimilaridade = JsonSerializer.Serialize(new
+                        var duplicado = hit.Source;
+                        if (duplicado == null)
                         {
-                            Resumo = $"Comparação entre Novo Registro ({original.Nome}) e Existente ({duplicado.Nome})",
-                            ComparativoDetalhado = comparativoList, 
-                            ScoreGlobal = hit.Score
-                        }),
-                        DataDeteccao = DateTime.UtcNow
-                    };
+                            _logger.LogWarning("Hit com score > 4 mas Source é nulo. Score: {Score}", hit.Score);
+                            continue;
+                        }
 
-                    await _repository.Add(suspeita);
+                        var comparativoList = new List<(string Campo, string ValorOriginal, string ValorEncontrado, double? ScoreCampo)>();
+                        
+                        if (hit.Highlight != null)
+                        {
+                            comparativoList = hit.Highlight.Select(h => (
+                                Campo: h.Key,
+                                ValorOriginal: ObterValorPorCampo(original, h.Key),
+                                ValorEncontrado: string.Join(", ", h.Value),
+                                ScoreCampo: hit.Score
+                            )).ToList();
+                        }
 
-                    var evento = CreateEvent(hit.Source);
-                    await _rabbitMQ.Send(evento);
+                        if (!ValidarUsernameSimilar(original.Email, duplicado.Email))
+                        {
+                            comparativoList = comparativoList.Where(x => x.Campo.ToLower() != "email").ToList();
+                        }
+
+                        if (comparativoList.Any())
+                        {
+                            var suspeita = new SuspeitaDuplicidade
+                            {
+                                IdOriginal = original.ClienteId,
+                                IdSuspeito = duplicado.Id,
+                                Score = hit.Score ?? 0,
+                                DetalhesSimilaridade = JsonSerializer.Serialize(new
+                                {
+                                    Resumo = $"Comparação entre Novo Registro ({original.Nome}) e Existente ({duplicado.Nome})",
+                                    ComparativoDetalhado = comparativoList.Select(c => new
+                                    {
+                                        c.Campo,
+                                        c.ValorOriginal,
+                                        c.ValorEncontrado,
+                                        c.ScoreCampo
+                                    }), 
+                                    ScoreGlobal = hit.Score
+                                }),
+                                DataDeteccao = DateTime.UtcNow
+                            };
+
+                            try
+                            {
+                                await _repository.Add(suspeita);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Erro ao adicionar suspeita de duplicidade. IdOriginal: {IdOriginal}, IdSuspeito: {IdSuspeito}", 
+                                    suspeita.IdOriginal, suspeita.IdSuspeito);
+                                throw;
+                            }
+
+                            try
+                            {
+                                var evento = CreateEvent(duplicado);
+                                await _rabbitMQ.Send(evento);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Erro ao enviar evento para fila. IdSuspeito: {IdSuspeito}", duplicado.Id);
+                                throw;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Erro ao processar hit do Elasticsearch. ClienteId: {ClienteId}, Score: {Score}", 
+                        original.ClienteId, hit.Score);
+                    // Continua processando os próximos hits mesmo se um falhar
                 }
             }
-        }
-        await _unitOfWork.CommitAsync();
 
+            try
+            {
+                await _unitOfWork.CommitAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Erro ao fazer commit no UnitOfWork. ClienteId: {ClienteId}", original.ClienteId);
+                throw;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Erro ao processar comando AnalyzeDuplicate. EventId: {EventId}", 
+                request?.EventData?.EventId);
+            throw;
+        }
     }
 
     private bool ValidarUsernameSimilar(string emailOrig, string emailDupl)
     {
-        if (string.IsNullOrEmpty(emailOrig) || string.IsNullOrEmpty(emailDupl)) return false;
+        if (string.IsNullOrEmpty(emailOrig) || string.IsNullOrEmpty(emailDupl)) 
+            return false;
 
-        var userOrig = emailOrig.Split('@')[0].ToLower();
-        var userDupl = emailDupl.Split('@')[0].ToLower();
-
-        if (userOrig == userDupl) return true;
-
-        if (userOrig.Length >= 3 && userDupl.Length >= 3)
+        try
         {
-            if (userOrig[..3] != userDupl[..3]) return false;
-        }
+            if (!emailOrig.Contains('@') || !emailDupl.Contains('@'))
+                return false;
 
-        return true;
+            var userOrig = emailOrig.Split('@')[0].ToLower();
+            var userDupl = emailDupl.Split('@')[0].ToLower();
+
+            if (string.IsNullOrEmpty(userOrig) || string.IsNullOrEmpty(userDupl))
+                return false;
+
+            if (userOrig == userDupl) 
+                return true;
+
+            if (userOrig.Length >= 3 && userDupl.Length >= 3)
+            {
+                if (userOrig[..3] != userDupl[..3]) 
+                    return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Erro ao validar username similar. EmailOrig: {EmailOrig}, EmailDupl: {EmailDupl}", 
+                emailOrig, emailDupl);
+            return false;
+        }
     }
 
     private string ObterValorPorCampo(CustomerEventData data, string fieldName)
     {
-        return fieldName.ToLower() switch
+        if (data == null || string.IsNullOrEmpty(fieldName))
+            return "N/A";
+
+        try
         {
-            "nome" => data.Nome,
-            "email" => data.Email,
-            "documento" => data.Documento,
-            "telefone.keyword" => data.Telefone,
-            "telefone" => data.Telefone,
-            _ => "N/A"
-        };
+            return fieldName.ToLower() switch
+            {
+                "nome" => data.Nome ?? "N/A",
+                "email" => data.Email ?? "N/A",
+                "documento" => data.Documento ?? "N/A",
+                "telefone.keyword" => data.Telefone ?? "N/A",
+                "telefone" => data.Telefone ?? "N/A",
+                _ => "N/A"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Erro ao obter valor por campo. FieldName: {FieldName}", fieldName);
+            return "N/A";
+        }
     }
 
     private CustomerEvent CreateEvent(CustomerSearchDto customerSearchDto)
     {
+        if (customerSearchDto == null)
+        {
+            _logger.LogWarning("Tentativa de criar evento com CustomerSearchDto nulo");
+            throw new ArgumentNullException(nameof(customerSearchDto));
+        }
+
         var evento = new CustomerEvent
         {
             EventId = Guid.NewGuid(),
@@ -170,6 +295,11 @@ public class AnalyzeDuplicateHandler : IRequestHandler<AnalyzeDuplicateCommand>
                 evento.Data.TipoCliente = "PJ";
                 evento.Data.Nome = customerSearchDto.Nome;
                 evento.Data.Documento = customerSearchDto.Documento;
+                break;
+
+            default:
+                _logger.LogWarning("Tipo de cliente desconhecido: {TipoCliente}. ClienteId: {ClienteId}", 
+                    customerSearchDto.TipoCliente, customerSearchDto.Id);
                 break;
         }
 

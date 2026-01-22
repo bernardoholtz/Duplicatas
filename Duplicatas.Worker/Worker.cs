@@ -22,15 +22,31 @@ namespace Duplicatas.Worker
 
         protected override Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _rabbitMQ.StartConsuming(async (customerEvent) =>
+            try
             {
-                using (var scope = _scopeFactory.CreateScope())
+                _rabbitMQ.StartConsuming(async (customerEvent) =>
                 {
-                    var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
+                    try
+                    {
+                        using (var scope = _scopeFactory.CreateScope())
+                        {
+                            var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
 
-                    await mediator.Send(new AnalyzeDuplicateCommand(customerEvent), stoppingToken);
-                }
-            });
+                            await mediator.Send(new AnalyzeDuplicateCommand(customerEvent), stoppingToken);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Erro ao processar mensagem do RabbitMQ. EventId: {EventId}", customerEvent?.EventId);
+                        throw;
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "Erro crítico ao iniciar o consumo de mensagens do RabbitMQ");
+                throw;
+            }
 
             return Task.CompletedTask;
         }
