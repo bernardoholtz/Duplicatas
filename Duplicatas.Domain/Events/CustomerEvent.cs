@@ -1,8 +1,5 @@
 namespace CustomerPlatform.Domain.Events
 {
-    /// <summary>
-    /// Evento genérico para operações de Customer (Criado ou Atualizado)
-    /// </summary>
     public class CustomerEvent
     {
         public Guid EventId { get; set; }
@@ -11,14 +8,13 @@ namespace CustomerPlatform.Domain.Events
         public CustomerEventData Data { get; set; }
     }
 
-    /// <summary>
-    /// Dados do evento de Customer
-    /// </summary>
     public class CustomerEventData
     {
         public Guid ClienteId { get; set; }
         public string TipoCliente { get; set; }
         public string Documento { get; set; }
         public string Nome { get; set; }
+        public string Telefone { get; set; }
+        public string Email { get; set; }
     }
 }

@@ -1,24 +1,39 @@
+using CustomerPlatform.Application.Commands.AnalyzeDuplicate;
+using MediatR;
+using Notification.Domain.Interfaces;
+
 namespace Duplicatas.Worker
 {
     public class Worker : BackgroundService
     {
         private readonly ILogger<Worker> _logger;
+        private readonly IServiceScopeFactory _scopeFactory;
+        private readonly IRabbitMQ _rabbitMQ;
 
-        public Worker(ILogger<Worker> logger)
+        public Worker(
+           ILogger<Worker> logger,
+           IServiceScopeFactory scopeFactory,
+           IRabbitMQ rabbitMQ)
         {
             _logger = logger;
+            _scopeFactory = scopeFactory;
+            _rabbitMQ = rabbitMQ;
         }
 
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            while (!stoppingToken.IsCancellationRequested)
+            _rabbitMQ.StartConsuming(async (customerEvent) =>
             {
-                if (_logger.IsEnabled(LogLevel.Information))
+                using (var scope = _scopeFactory.CreateScope())
                 {
-                    _logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
+                    var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
+
+                    await mediator.Send(new AnalyzeDuplicateCommand(customerEvent), stoppingToken);
                 }
-                await Task.Delay(1000, stoppingToken);
-            }
+            });
+
+            return Task.CompletedTask;
         }
+
     }
 }

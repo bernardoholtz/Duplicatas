@@ -8,10 +8,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="MediatR" Version="14.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.5" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Duplicatas.Application\Duplicatas.Application.csproj" />
     <ProjectReference Include="..\Duplicatas.Domain\Duplicatas.Domain.csproj" />
     <ProjectReference Include="..\Duplicatas.Infra\Duplicatas.Infra.csproj" />
   </ItemGroup>

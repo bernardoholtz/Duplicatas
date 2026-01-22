@@ -7,127 +7,87 @@ using RabbitMQ.Client.Events;
 using System.Text;
 using System.Text.Json;
 
-namespace Notification.Infra.Messaging
+public class RabbitMq : IRabbitMQ, IDisposable
 {
-    public class RabbitMq : IRabbitMQ, IDisposable
+    private readonly IConnection _connection;
+    private readonly IModel _consumeChannel;
+    private readonly ILogger<RabbitMq> _logger;
+    private const string queueNameCliente = "EventosCliente";
+    private const string queueNameDuplicidade = "SuspeitosDuplicidadeCliente";
+
+    public RabbitMq(IConfiguration configuration, ILogger<RabbitMq> logger)
     {
-        private readonly IConnection _connection;
-        private readonly IModel _channel;
-        private readonly ILogger<RabbitMq> _logger;
-        private const string queueName = "EventosCliente";
-        public RabbitMq(
-            IConfiguration configuration,
-            ILogger<IRabbitMQ> logger)
+        _logger = logger;
+        var factory = new ConnectionFactory
+
         {
-            _logger = (ILogger<RabbitMq>?)(logger ?? throw new ArgumentNullException(nameof(logger)));
 
-            var hostName = configuration["RabbitMQ:HostName"];
-            var port = int.Parse(configuration["RabbitMQ:Port"]);
-            var userName = configuration["RabbitMQ:UserName"];
-            var password = configuration["RabbitMQ:Password"];
+            HostName = configuration["RabbitMQ:HostName"],
 
-            var factory = new ConnectionFactory
-            {
-                HostName = hostName,
-                Port = port,
-                UserName = userName,
-                Password = password,
+            Port = int.Parse(configuration["RabbitMQ:Port"]),
 
-            };
+            UserName = configuration["RabbitMQ:UserName"],
 
-            try
-            {
-                _connection = factory.CreateConnection();
-                _logger.LogInformation("Conexão com RabbitMQ estabelecida com sucesso");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Erro ao conectar com RabbitMQ");
-                throw;
-            }
-        }
-        public async Task<CustomerEvent> Consume()
-        {
-            try
-            {
-                using var _channel = _connection.CreateModel();
-                // Declara a fila se não existir
-                _channel.QueueDeclare(
-                    queue: queueName,
-                    durable: true,
-                    exclusive: false,
-                    autoDelete: false,
-                    arguments: null);
+            Password = configuration["RabbitMQ:Password"],
 
-                var consumer = new EventingBasicConsumer(_channel);
+            AutomaticRecoveryEnabled = true,
 
-                var message = new CustomerEvent();
+            NetworkRecoveryInterval = TimeSpan.FromSeconds(10)
 
-                consumer.Received += async (_, ea) =>
-                {
-                    var json = Encoding.UTF8.GetString(ea.Body.ToArray());
-                    message = JsonSerializer.Deserialize<CustomerEvent>(json)!;
+        };
 
-                    //await _consumer.HandleAsync(message);
+        _connection = factory.CreateConnection();
+        _consumeChannel = _connection.CreateModel();
+        _consumeChannel.BasicQos(0, 1, false);
 
-                    _channel.BasicAck(ea.DeliveryTag, false);
-                };
-
-
-                _channel.BasicConsume("member_queue", false, consumer);
-
-                return message;
-
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Erro ao consumir a fila {QueueName}", queueName);
-                throw;
-            }
-        }
-
-        public void Dispose()
-        {
-            _channel?.Close();
-            _channel?.Dispose();
-            _connection?.Close();
-            _connection?.Dispose();
-        }
-
-        public async Task Send(CustomerEvent customerEvent)
-        {
-            try
-            {
-                using var _channel = _connection.CreateModel();
-                // Declara a fila se não existir
-                _channel.QueueDeclare(
-                    queue: queueName,
-                    durable: true,
-                    exclusive: false,
-                    autoDelete: false,
-                    arguments: null);
-
-                var json = JsonSerializer.Serialize(customerEvent);
-                var body = Encoding.UTF8.GetBytes(json);
-
-                var properties = _channel.CreateBasicProperties();
-                properties.Persistent = true; // Garante que a mensagem será persistida
-
-                _channel.BasicPublish(
-                    exchange: string.Empty,
-                    routingKey: queueName,
-                    basicProperties: properties,
-                    body: body);
-
-                _logger.LogInformation("Mensagem publicada na fila {QueueName}: {Message}", queueName, json);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Erro ao publicar mensagem na fila {QueueName}", queueName);
-                throw;
-            }
-        }
-
+        _consumeChannel.QueueDeclare(queue: queueNameCliente, durable: true, exclusive: false, autoDelete: false);
+        _consumeChannel.QueueDeclare(queue: queueNameDuplicidade, durable: true, exclusive: false, autoDelete: false);
     }
 
+    public void StartConsuming(Func<CustomerEvent, Task> onMessageReceived)
+    {
+        var consumer = new EventingBasicConsumer(_consumeChannel);
+
+        consumer.Received += async (model, ea) =>
+        {
+            try
+            {
+                var json = Encoding.UTF8.GetString(ea.Body.ToArray());
+                var message = JsonSerializer.Deserialize<CustomerEvent>(json)!;
+
+                await onMessageReceived(message);
+
+                _consumeChannel.BasicAck(ea.DeliveryTag, false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Erro no Handler.");
+                _consumeChannel.BasicNack(ea.DeliveryTag, false, requeue: true);
+            }
+        };
+
+        _consumeChannel.BasicConsume(queue: queueNameCliente, autoAck: false, consumer: consumer);
+    }
+
+    public async Task Send(CustomerEvent customerEvent)
+    {
+        using var sendChannel = _connection.CreateModel();
+
+        var json = JsonSerializer.Serialize(customerEvent);
+        var body = Encoding.UTF8.GetBytes(json);
+        var properties = sendChannel.CreateBasicProperties();
+        properties.Persistent = true;
+
+        sendChannel.BasicPublish(
+            exchange: string.Empty,
+            routingKey: queueNameDuplicidade,
+            basicProperties: properties,
+            body: body);
+    }
+
+    public void Dispose()
+    {
+        _consumeChannel?.Dispose();
+        _connection?.Dispose();
+    }
 }

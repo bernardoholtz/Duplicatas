@@ -4,7 +4,7 @@ namespace Notification.Domain.Interfaces
 {
     public interface IRabbitMQ
     {
-        Task<CustomerEvent> Consume();
+        void StartConsuming(Func<CustomerEvent, Task> onMessageReceived);
         Task Send(CustomerEvent customerEvent);
     }
 }
